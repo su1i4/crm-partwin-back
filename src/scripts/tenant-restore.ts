@@ -2,7 +2,7 @@
  * Восстановить ОДИН магазин из копии tenant:backup (или из папки json/ полной выгрузки):
  *   npm run tenant:restore -- <папка-копии> --yes
  * В одной транзакции: строки магазина удаляются (в порядке зависимостей) и вставляются из копии.
- * Другие магазины не затрагиваются. Перед восстановлением делается копия текущего состояния.
+ * Другие магазины не затрагиваются. Перед восстановлением сделайте свежую копию (tenant:backup) — на случай отката.
  */
 import 'reflect-metadata';
 import { readdir, readFile } from 'fs/promises';
@@ -12,7 +12,9 @@ import AppDataSource from '../database/data-source';
 async function main() {
   const [dir, yes] = process.argv.slice(2);
   if (!dir || yes !== '--yes') throw new Error('npm run tenant:restore -- <папка> --yes');
-  const files = (await readdir(dir)).filter((f) => f.endsWith('.json') && !f.startsWith('__') && f !== 'manifest.json');
+  const files = (await readdir(dir)).filter((f) => f.endsWith('.json') && !f.startsWith('__') && f !== 'manifest.json')
+    // Журнал платформы и сеансы поддержки — не данные магазина, не восстанавливаются
+    .filter((f) => !['platform_admin_log.json', 'support_sessions.json', 'support_grants.json'].includes(f));
   const tenant = JSON.parse(await readFile(join(dir, '__tenant.json'), 'utf8'))[0];
   if (!tenant?.id) throw new Error('В копии нет __tenant.json');
   const ds = await AppDataSource.initialize();
@@ -35,13 +37,15 @@ async function main() {
   await qr.startTransaction();
   try {
     await qr.query(`SELECT set_config('app.tenant_id', $1, true)`, [tenant.id]);
-    for (const t of [...order].reverse()) await qr.query(`DELETE FROM "${t}" WHERE tenant_id = $1`, [tenant.id]);
+    // Журнал действий магазина защищён от удаления (хранится 3 года): его не чистим, только дописываем недостающее
+    const APPEND_ONLY = new Set(['audit_log']);
+    for (const t of [...order].reverse()) if (!APPEND_ONLY.has(t)) await qr.query(`DELETE FROM "${t}" WHERE tenant_id = $1`, [tenant.id]);
     let total = 0;
     for (const t of order) {
       const rows = JSON.parse(await readFile(join(dir, `${t}.json`), 'utf8'));
       for (let i = 0; i < rows.length; i += 500) {
         const chunk = rows.slice(i, i + 500);
-        await qr.query(`INSERT INTO "${t}" SELECT * FROM json_populate_recordset(null::"${t}", $1::json)`, [JSON.stringify(chunk)]);
+        await qr.query(`INSERT INTO "${t}" SELECT * FROM json_populate_recordset(null::"${t}", $1::json)${APPEND_ONLY.has(t) ? ' ON CONFLICT DO NOTHING' : ''}`, [JSON.stringify(chunk)]);
       }
       total += rows.length;
     }

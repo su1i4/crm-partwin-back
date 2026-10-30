@@ -15,6 +15,7 @@ import { NotificationsService } from '../notifications/notifications.service';
 import { TelegramService } from '../telegram/telegram.service';
 import { importVehicles } from '../vehicles/vehicles-import';
 import { PlatformAdmin, PlatformAdminLog, SupportGrant, SupportSession } from './entities/admin.entity';
+import { AccessService } from '../auth/access.service';
 
 export const ADMIN_ROLE = 'adminRole';
 export const AdminRole = (role: 'admin' | 'support') => SetMetadata(ADMIN_ROLE, role);
@@ -40,7 +41,9 @@ export class AdminGuard implements CanActivate {
   async canActivate(ctx: ExecutionContext) {
     const req = ctx.switchToHttp().getRequest();
     const token = extractBearer(req);
-    const p = token ? this.tokens.verifyPlatform(token, `${this.config.jwtAccessSecret}:admin`, 'admin') : null;
+    const p = token
+      ? this.tokens.verifyPlatform(token, `${this.config.jwtAccessSecret}:admin`, 'admin')
+      : null;
     if (!p) throw Errors.unauthorized('Войдите в админку платформы', 'ADMIN_UNAUTHORIZED');
     const a = await this.platform.repo(PlatformAdmin).findOne({ where: { id: p.sub } });
     if (!a?.isActive) throw Errors.unauthorized('Учётная запись отключена', 'ADMIN_UNAUTHORIZED');
@@ -68,12 +71,26 @@ export class AdminService {
     private readonly notifications: NotificationsService,
     private readonly telegram: TelegramService,
     private readonly ctx: RequestContext,
+    private readonly access: AccessService,
   ) {
     this.box = new SecretBox(config.encryptionKey);
   }
 
-  async log(admin: AdminUser, action: string, tenantId: string | null, details: Record<string, unknown> = {}) {
-    await this.platform.repo(PlatformAdminLog).insert({ adminId: admin.id, action, tenantId, details: details as any, ip: this.ctx.get('ip') ?? null });
+  async log(
+    admin: AdminUser,
+    action: string,
+    tenantId: string | null,
+    details: Record<string, unknown> = {},
+  ) {
+    await this.platform
+      .repo(PlatformAdminLog)
+      .insert({
+        adminId: admin.id,
+        action,
+        tenantId,
+        details: details as any,
+        ip: this.ctx.get('ip') ?? null,
+      });
   }
 
   // ── Учётные записи ───────────────────────────────────────
@@ -82,28 +99,54 @@ export class AdminService {
   async createAdmin(email: string, name: string, password: string, role: 'admin' | 'support') {
     if (password.length < 10) throw new Error('Пароль — от 10 символов');
     const secret = authenticator.generateSecret();
-    const a = await this.platform.repo(PlatformAdmin).save({ email: email.toLowerCase(), name, role, passwordHash: await bcrypt.hash(password, 12), totpSecretEnc: this.box.encrypt(secret) } as any);
+    const a = await this.platform
+      .repo(PlatformAdmin)
+      .save({
+        email: email.toLowerCase(),
+        name,
+        role,
+        passwordHash: await bcrypt.hash(password, 12),
+        totpSecretEnc: this.box.encrypt(secret),
+      } as any);
     return { id: a.id, otpauthUrl: authenticator.keyuri(email, 'Autoparts Admin', secret), secret };
   }
 
   /** Вход: пароль + код из приложения (двухфакторная обязательна). 5 ошибок — блокировка на 15 минут. */
   async login(email: string, password: string, code: string) {
     const repo = this.platform.repo(PlatformAdmin);
-    const a = await repo.createQueryBuilder('a').addSelect(['a.passwordHash', 'a.totpSecretEnc']).where('a.email = :e', { e: email.toLowerCase() }).getOne();
+    const a = await repo
+      .createQueryBuilder('a')
+      .addSelect(['a.passwordHash', 'a.totpSecretEnc'])
+      .where('a.email = :e', { e: email.toLowerCase() })
+      .getOne();
     if (!a || !a.isActive) {
       await bcrypt.compare(password, '$2b$12$abcdefghijklmnopqrstuuDXvCzsQ2F3bqHT3Y6Wq3R7dGJQ1z7pS');
       throw Errors.unauthorized('Неверный вход', 'ADMIN_LOGIN_FAILED');
     }
-    if (a.lockedUntil && a.lockedUntil > new Date()) throw Errors.tooMany('Слишком много попыток, подождите 15 минут');
-    const ok = (await bcrypt.compare(password, a.passwordHash)) && authenticator.check(String(code ?? '').trim(), this.box.decrypt(a.totpSecretEnc));
+    if (a.lockedUntil && a.lockedUntil > new Date())
+      throw Errors.tooMany('Слишком много попыток, подождите 15 минут');
+        const ok = (await bcrypt.compare(password, a.passwordHash)) && authenticator.clone({ window: 1 }).check(String(code ?? '').trim(), this.box.decrypt(a.totpSecretEnc));
     if (!ok) {
       const failed = a.failedLogins + 1;
-      await repo.update({ id: a.id }, { failedLogins: failed >= 5 ? 0 : failed, lockedUntil: failed >= 5 ? new Date(Date.now() + 15 * 60_000) : null });
+      await repo.update(
+        { id: a.id },
+        {
+          failedLogins: failed >= 5 ? 0 : failed,
+          lockedUntil: failed >= 5 ? new Date(Date.now() + 15 * 60_000) : null,
+        },
+      );
       throw Errors.unauthorized('Неверный вход', 'ADMIN_LOGIN_FAILED');
     }
     await repo.update({ id: a.id }, { failedLogins: 0, lockedUntil: null, lastLoginAt: new Date() });
     await this.log({ id: a.id, role: a.role, name: a.name }, 'admin.login', null);
-    return { accessToken: this.tokens.signPlatform({ sub: a.id, typ: 'admin' }, `${this.config.jwtAccessSecret}:admin`, '8h'), admin: { id: a.id, name: a.name, role: a.role } };
+    return {
+      accessToken: this.tokens.signPlatform(
+        { sub: a.id, typ: 'admin' },
+        `${this.config.jwtAccessSecret}:admin`,
+        '8h',
+      ),
+      admin: { id: a.id, name: a.name, role: a.role },
+    };
   }
 
   // ── Магазины и подписка ──────────────────────────────────
@@ -142,19 +185,42 @@ export class AdminService {
   async tenant(id: string) {
     const [t] = await this.platform.ds.query(`SELECT * FROM tenants WHERE id = $1`, [id]);
     if (!t) throw Errors.notFound('Магазин');
-    const support = await this.platform.repo(SupportSession).find({ where: { tenantId: id }, order: { createdAt: 'DESC' }, take: 20 });
+    const support = await this.platform
+      .repo(SupportSession)
+      .find({ where: { tenantId: id }, order: { createdAt: 'DESC' }, take: 20 });
     return { ...t, ...(await this.stats(id)), support };
   }
 
   /** Подписка вручную: статус, дата окончания, тариф и лимиты, заметка об оплате. */
-  async setSubscription(admin: AdminUser, id: string, dto: { status?: 'trial' | 'active' | 'suspended'; subscriptionUntil?: string | null; plan?: string; limits?: Record<string, number>; note?: string }) {
-    const [t] = await this.platform.ds.query(`SELECT status, plan, limits, subscription_until FROM tenants WHERE id = $1`, [id]);
+  async setSubscription(
+    admin: AdminUser,
+    id: string,
+    dto: {
+      status?: 'trial' | 'active' | 'suspended';
+      subscriptionUntil?: string | null;
+      plan?: string;
+      limits?: Record<string, number>;
+      note?: string;
+    },
+  ) {
+    const [t] = await this.platform.ds.query(
+      `SELECT status, plan, limits, subscription_until FROM tenants WHERE id = $1`,
+      [id],
+    );
     if (!t) throw Errors.notFound('Магазин');
     await this.platform.ds.query(
       `UPDATE tenants SET status = coalesce($2, status), subscription_until = CASE WHEN $3::boolean THEN $4::timestamptz ELSE subscription_until END,
               plan = coalesce($5, plan), limits = coalesce($6::jsonb, limits), updated_at = now() WHERE id = $1`,
-      [id, dto.status ?? null, dto.subscriptionUntil !== undefined, dto.subscriptionUntil ?? null, dto.plan ?? null, dto.limits ? JSON.stringify(dto.limits) : null],
+      [
+        id,
+        dto.status ?? null,
+        dto.subscriptionUntil !== undefined,
+        dto.subscriptionUntil ?? null,
+        dto.plan ?? null,
+        dto.limits ? JSON.stringify(dto.limits) : null,
+      ],
     );
+    this.access.invalidateTenant(id);
     await this.log(admin, 'tenant.subscription', id, { before: t, after: dto });
     return this.tenant(id);
   }
@@ -171,7 +237,11 @@ export class AdminService {
     return this.platform.ds.query(sql, [q ?? null]);
   }
 
-  async saveDictionary(admin: AdminUser, kind: 'makes' | 'brands' | 'synonyms' | 'wmi', row: Record<string, any>) {
+  async saveDictionary(
+    admin: AdminUser,
+    kind: 'makes' | 'brands' | 'synonyms' | 'wmi',
+    row: Record<string, any>,
+  ) {
     let res;
     if (kind === 'makes') {
       [res] = await this.platform.ds.query(
@@ -179,7 +249,9 @@ export class AdminService {
         [row.code, row.name, row.aliases ?? []],
       );
     } else if (kind === 'wmi') {
-      const [m] = await this.platform.ds.query(`SELECT id FROM global_vehicle_makes WHERE code = lower($1)`, [row.make]);
+      const [m] = await this.platform.ds.query(`SELECT id FROM global_vehicle_makes WHERE code = lower($1)`, [
+        row.make,
+      ]);
       if (!m) throw Errors.bad('MAKE_NOT_FOUND', 'Марка не найдена');
       [res] = await this.platform.ds.query(
         `INSERT INTO global_vin_wmi (wmi, make_id, country) VALUES (upper($1), $2, $3) ON CONFLICT (wmi) DO UPDATE SET make_id = EXCLUDED.make_id, country = EXCLUDED.country RETURNING *`,
@@ -189,10 +261,20 @@ export class AdminService {
       [res] = await this.platform.ds.query(
         `INSERT INTO global_brands (name, normalized_name, aliases, aliases_norm, is_car_maker, country) VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT (normalized_name) DO UPDATE SET name = EXCLUDED.name, aliases = EXCLUDED.aliases, aliases_norm = EXCLUDED.aliases_norm, country = EXCLUDED.country, updated_at = now() RETURNING *`,
-        [row.name, normalizeBrand(row.name), row.aliases ?? [], (row.aliases ?? []).map((a: string) => normalizeBrand(a)), !!row.isCarMaker, row.country ?? null],
+        [
+          row.name,
+          normalizeBrand(row.name),
+          row.aliases ?? [],
+          (row.aliases ?? []).map((a: string) => normalizeBrand(a)),
+          !!row.isCarMaker,
+          row.country ?? null,
+        ],
       );
     } else {
-      [res] = await this.platform.ds.query(`INSERT INTO global_search_synonyms (word, target, lang) VALUES (lower($1), lower($2), coalesce($3, 'ru')) ON CONFLICT (word, target) DO NOTHING RETURNING *`, [row.word, row.target, row.lang ?? null]);
+      [res] = await this.platform.ds.query(
+        `INSERT INTO global_search_synonyms (word, target, lang) VALUES (lower($1), lower($2), coalesce($3, 'ru')) ON CONFLICT (word, target) DO NOTHING RETURNING *`,
+        [row.word, row.target, row.lang ?? null],
+      );
     }
     await this.log(admin, `dictionary.${kind}`, null, row);
     return res ?? { ok: true };
@@ -211,8 +293,14 @@ export class AdminService {
   // ── Мониторинг ───────────────────────────────────────────
 
   async monitoring() {
-    const tenants = await this.platform.ds.query(`SELECT id, name FROM tenants WHERE status <> 'deleted' ORDER BY name`);
-    const [outbox] = await this.platform.ds.query(`SELECT count(*) FILTER (WHERE last_error IS NOT NULL)::int AS failed, count(*) FILTER (WHERE processed_at IS NULL)::int AS pending FROM outbox_events`).catch(() => [{ failed: null, pending: null }]);
+    const tenants = await this.platform.ds.query(
+      `SELECT id, name FROM tenants WHERE status <> 'deleted' ORDER BY name`,
+    );
+    const [outbox] = await this.platform.ds
+      .query(
+        `SELECT count(*) FILTER (WHERE last_error IS NOT NULL)::int AS failed, count(*) FILTER (WHERE processed_at IS NULL)::int AS pending FROM outbox_events`,
+      )
+      .catch(() => [{ failed: null, pending: null }]);
     const perTenant = [];
     for (const t of tenants) {
       const r = await this.tenantTx.run(
@@ -228,7 +316,13 @@ export class AdminService {
         },
         { tenantId: t.id, userId: null },
       );
-      if (r.offlineUnsent || r.stuckImports || r.stockMismatches || (r.ocrFoundRate !== null && Number(r.ocrFoundRate) < 60)) perTenant.push({ tenantId: t.id, name: t.name, ...r });
+      if (
+        r.offlineUnsent ||
+        r.stuckImports ||
+        r.stockMismatches ||
+        (r.ocrFoundRate !== null && Number(r.ocrFoundRate) < 60)
+      )
+        perTenant.push({ tenantId: t.id, name: t.name, ...r });
     }
     return { outbox, problems: perTenant, checkedTenants: tenants.length };
   }
@@ -244,7 +338,17 @@ export class AdminService {
   // ── Вход поддержки ───────────────────────────────────────
 
   private async notifyOwners(tenantId: string, title: string, body?: string) {
-    await this.tenantTx.run((tx) => this.notifications.notify(tx, { type: 'staff.changed', title, body, ownersOnly: true, link: '/settings/support' }), { tenantId, userId: null });
+    await this.tenantTx.run(
+      (tx) =>
+        this.notifications.notify(tx, {
+          type: 'staff.changed',
+          title,
+          body,
+          ownersOnly: true,
+          link: '/settings/support',
+        }),
+      { tenantId, userId: null },
+    );
     const owners = await this.platform.ds.query(
       `SELECT u.telegram_chat_id AS chat FROM tenants t JOIN users u ON u.id = t.owner_user_id WHERE t.id = $1 AND u.telegram_chat_id IS NOT NULL`,
       [tenantId],
@@ -253,16 +357,29 @@ export class AdminService {
   }
 
   private token(s: SupportSession) {
-    return this.tokens.signPlatform({ sub: s.adminId, typ: 'support', ssid: s.id, tid: s.tenantId }, `${this.config.jwtAccessSecret}:support`, `${SUPPORT_MINUTES}m`);
+    return this.tokens.signPlatform(
+      { sub: s.adminId, typ: 'support', ssid: s.id, tid: s.tenantId },
+      `${this.config.jwtAccessSecret}:support`,
+      `${SUPPORT_MINUTES}m`,
+    );
   }
 
   /**
    * Запросить вход: есть разрешение владельца на 24 часа — сеанс сразу (права из разрешения);
    * иначе — запрос владельцу; аварийно (emergency) — сразу, с причиной и немедленным уведомлением.
    */
-  async requestSupport(admin: AdminUser, tenantId: string, dto: { reason: string; emergency?: boolean; canWrite?: boolean }) {
+  async requestSupport(
+    admin: AdminUser,
+    tenantId: string,
+    dto: { reason: string; emergency?: boolean; canWrite?: boolean },
+  ) {
     const repo = this.platform.repo(SupportSession);
-    const grant = await this.platform.ds.query(`SELECT * FROM support_grants WHERE tenant_id = $1 AND revoked_at IS NULL AND until > now() ORDER BY until DESC LIMIT 1`, [tenantId]).then((r) => r[0]);
+    const grant = await this.platform.ds
+      .query(
+        `SELECT * FROM support_grants WHERE tenant_id = $1 AND revoked_at IS NULL AND until > now() ORDER BY until DESC LIMIT 1`,
+        [tenantId],
+      )
+      .then((r) => r[0]);
     const now = new Date();
     const active = !!grant || !!dto.emergency;
     const s = await repo.save({
@@ -276,22 +393,46 @@ export class AdminService {
       startedAt: active ? now : null,
       expiresAt: active ? new Date(now.getTime() + SUPPORT_MINUTES * 60_000) : null,
     } as any);
-    await this.log(admin, dto.emergency ? 'support.emergency' : 'support.request', tenantId, { sessionId: s.id, reason: dto.reason });
-    if (s.emergency) await this.notifyOwners(tenantId, 'Аварийный вход поддержки в магазин', `Причина: ${dto.reason}. Только просмотр, 60 минут. Завершить — в настройках, «Поддержка».`);
-    else if (!active) await this.notifyOwners(tenantId, 'Поддержка просит доступ к магазину', `Причина: ${dto.reason}. Разрешить — в настройках, «Поддержка».`);
+    await this.log(admin, dto.emergency ? 'support.emergency' : 'support.request', tenantId, {
+      sessionId: s.id,
+      reason: dto.reason,
+    });
+    if (s.emergency)
+      await this.notifyOwners(
+        tenantId,
+        'Аварийный вход поддержки в магазин',
+        `Причина: ${dto.reason}. Только просмотр, 60 минут. Завершить — в настройках, «Поддержка».`,
+      );
+    else if (!active)
+      await this.notifyOwners(
+        tenantId,
+        'Поддержка просит доступ к магазину',
+        `Причина: ${dto.reason}. Разрешить — в настройках, «Поддержка».`,
+      );
     else await this.notifyOwners(tenantId, 'Поддержка вошла в магазин (по вашему разрешению)', dto.reason);
     return { session: s, ...(active ? { supportToken: this.token(s), expiresAt: s.expiresAt } : {}) };
   }
 
   /** Токен для подтверждённого владельцем запроса. */
   async enterSupport(admin: AdminUser, sessionId: string) {
-    const s = await this.platform.repo(SupportSession).findOne({ where: { id: sessionId, adminId: admin.id } });
-    if (!s || s.status !== 'active' || !s.expiresAt || s.expiresAt < new Date()) throw Errors.bad('SUPPORT_NOT_ACTIVE', 'Сеанс не подтверждён владельцем или уже завершён');
-    return { supportToken: this.token(s), expiresAt: s.expiresAt, canWrite: s.canWrite, showMoney: s.showMoney };
+    const s = await this.platform
+      .repo(SupportSession)
+      .findOne({ where: { id: sessionId, adminId: admin.id } });
+    if (!s || s.status !== 'active' || !s.expiresAt || s.expiresAt < new Date())
+      throw Errors.bad('SUPPORT_NOT_ACTIVE', 'Сеанс не подтверждён владельцем или уже завершён');
+    return {
+      supportToken: this.token(s),
+      expiresAt: s.expiresAt,
+      canWrite: s.canWrite,
+      showMoney: s.showMoney,
+    };
   }
 
   async endSupport(admin: AdminUser, sessionId: string) {
-    await this.platform.ds.query(`UPDATE support_sessions SET status = 'ended', ended_at = now(), updated_at = now() WHERE id = $1 AND admin_id = $2 AND status IN ('active', 'requested')`, [sessionId, admin.id]);
+    await this.platform.ds.query(
+      `UPDATE support_sessions SET status = 'ended', ended_at = now(), updated_at = now() WHERE id = $1 AND admin_id = $2 AND status IN ('active', 'requested')`,
+      [sessionId, admin.id],
+    );
     await this.log(admin, 'support.end', null, { sessionId });
     return { ended: true };
   }
@@ -312,7 +453,13 @@ export class SupportOwnerService {
   async state() {
     this.assertOwner();
     const tenantId = this.ctx.requireTenantId();
-    const grant = (await this.platform.ds.query(`SELECT id, until, can_write AS "canWrite", show_money AS "showMoney" FROM support_grants WHERE tenant_id = $1 AND revoked_at IS NULL AND until > now() ORDER BY until DESC LIMIT 1`, [tenantId]))[0] ?? null;
+    const grant =
+      (
+        await this.platform.ds.query(
+          `SELECT id, until, can_write AS "canWrite", show_money AS "showMoney" FROM support_grants WHERE tenant_id = $1 AND revoked_at IS NULL AND until > now() ORDER BY until DESC LIMIT 1`,
+          [tenantId],
+        )
+      )[0] ?? null;
     const sessions = await this.platform.ds.query(
       `SELECT s.id, s.status, s.reason, s.emergency, s.can_write AS "canWrite", s.show_money AS "showMoney", s.started_at AS "startedAt", s.expires_at AS "expiresAt", s.created_at AS "createdAt", a.name AS "adminName"
          FROM support_sessions s JOIN platform_admins a ON a.id = s.admin_id WHERE s.tenant_id = $1 ORDER BY s.created_at DESC LIMIT 30`,
@@ -326,16 +473,33 @@ export class SupportOwnerService {
   async grant(dto: { hours?: number; canWrite?: boolean; showMoney?: boolean }) {
     this.assertOwner();
     const tenantId = this.ctx.requireTenantId();
-    await this.platform.ds.query(`UPDATE support_grants SET revoked_at = now() WHERE tenant_id = $1 AND revoked_at IS NULL`, [tenantId]);
-    await this.platform.repo(SupportGrant).save({ tenantId, grantedBy: this.ctx.userId!, until: new Date(Date.now() + Math.min(dto.hours ?? 24, 72) * 3600_000), canWrite: !!dto.canWrite, showMoney: !!dto.showMoney } as any);
+    await this.platform.ds.query(
+      `UPDATE support_grants SET revoked_at = now() WHERE tenant_id = $1 AND revoked_at IS NULL`,
+      [tenantId],
+    );
+    await this.platform
+      .repo(SupportGrant)
+      .save({
+        tenantId,
+        grantedBy: this.ctx.userId!,
+        until: new Date(Date.now() + Math.min(dto.hours ?? 24, 72) * 3600_000),
+        canWrite: !!dto.canWrite,
+        showMoney: !!dto.showMoney,
+      } as any);
     return this.state();
   }
 
   async revoke() {
     this.assertOwner();
     const tenantId = this.ctx.requireTenantId();
-    await this.platform.ds.query(`UPDATE support_grants SET revoked_at = now() WHERE tenant_id = $1 AND revoked_at IS NULL`, [tenantId]);
-    await this.platform.ds.query(`UPDATE support_sessions SET status = 'ended', ended_at = now() WHERE tenant_id = $1 AND status IN ('active', 'requested')`, [tenantId]);
+    await this.platform.ds.query(
+      `UPDATE support_grants SET revoked_at = now() WHERE tenant_id = $1 AND revoked_at IS NULL`,
+      [tenantId],
+    );
+    await this.platform.ds.query(
+      `UPDATE support_sessions SET status = 'ended', ended_at = now() WHERE tenant_id = $1 AND status IN ('active', 'requested')`,
+      [tenantId],
+    );
     return this.state();
   }
 
@@ -353,7 +517,10 @@ export class SupportOwnerService {
 
   async decline(id: string) {
     this.assertOwner();
-    await this.platform.ds.query(`UPDATE support_sessions SET status = 'declined', ended_at = now() WHERE id = $1 AND tenant_id = $2 AND status = 'requested'`, [id, this.ctx.requireTenantId()]);
+    await this.platform.ds.query(
+      `UPDATE support_sessions SET status = 'declined', ended_at = now() WHERE id = $1 AND tenant_id = $2 AND status = 'requested'`,
+      [id, this.ctx.requireTenantId()],
+    );
     return this.state();
   }
 }

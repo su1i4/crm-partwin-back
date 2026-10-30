@@ -19,7 +19,7 @@ async function main() {
   const ds = await AppDataSource.initialize();
   await ds.query(
     `INSERT INTO platform_admins (email, name, password_hash, totp_secret_enc, role) VALUES (lower($1), $2, $3, $4, $5)
-     ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, password_hash = EXCLUDED.password_hash, totp_secret_enc = EXCLUDED.totp_secret_enc, role = EXCLUDED.role, is_active = true`,
+          ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name, password_hash = EXCLUDED.password_hash, totp_secret_enc = EXCLUDED.totp_secret_enc, role = EXCLUDED.role, is_active = true, failed_logins = 0, locked_until = NULL`,
     [email, name, await bcrypt.hash(password, 12), box.encrypt(secret), role],
   );
   console.log(`Готово. Добавьте в приложение-аутентификатор:\n${authenticator.keyuri(email, 'Autoparts Admin', secret)}`);

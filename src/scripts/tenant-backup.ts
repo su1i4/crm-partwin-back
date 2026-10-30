@@ -17,7 +17,7 @@ async function main() {
   const tables: string[] = (
     await ds.query(
       `SELECT c.table_name FROM information_schema.columns c JOIN information_schema.tables t ON t.table_name = c.table_name AND t.table_schema = c.table_schema
-        WHERE c.table_schema = 'public' AND c.column_name = 'tenant_id' AND t.table_type = 'BASE TABLE' AND c.table_name NOT IN ('outbox_events', 'user_sessions', 'device_pairing_codes')`,
+        WHERE c.table_schema = 'public' AND c.column_name = 'tenant_id' AND t.table_type = 'BASE TABLE' AND c.table_name NOT IN ('outbox_events', 'user_sessions', 'device_pairing_codes', 'platform_admin_log', 'support_sessions', 'support_grants')`,
     )
   ).map((r: any) => r.table_name);
   const qr = ds.createQueryRunner();
